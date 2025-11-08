@@ -1,0 +1,63 @@
+#!/usr/bin/env zsh
+# ZSH Welcome Home - MOTD Banner
+# Message of the Day script for ZSH
+
+# Function to print welcome banner
+_print_welcome_banner() {
+  local mode="${1:-full}"
+  
+  # Color definitions
+  local reset="\033[0m"
+  local bold="\033[1m"
+  local blue="\033[34m"
+  local cyan="\033[36m"
+  local green="\033[32m"
+  local yellow="\033[33m"
+  local magenta="\033[35m"
+  
+  # System information
+  local username="${USER:-$(whoami)}"
+  local hostname="${HOSTNAME:-$(hostname)}"
+  local shell_version="${ZSH_VERSION}"
+  local os_type="$(uname -s)"
+  local kernel="$(uname -r)"
+  
+  # Date and time
+  local current_date="$(date '+%A, %B %d, %Y')"
+  local current_time="$(date '+%I:%M %p')"
+  
+  # Uptime (if available)
+  local uptime_info=""
+  if command -v uptime &> /dev/null; then
+    uptime_info="$(uptime | sed 's/.*up \([^,]*\).*/\1/' | xargs)"
+  fi
+  
+  # Load average (if available)
+  local load_avg=""
+  if command -v uptime &> /dev/null; then
+    load_avg="$(uptime | grep -oE 'load average[s]*: [0-9.,]+' | cut -d':' -f2 | xargs)"
+  fi
+  
+  if [[ "$mode" == "full" ]]; then
+    echo -e "${bold}${cyan}╔════════════════════════════════════════════════════════════╗${reset}"
+    echo -e "${bold}${cyan}║                    ${magenta}Welcome Home!${cyan}                         ║${reset}"
+    echo -e "${bold}${cyan}╠════════════════════════════════════════════════════════════╣${reset}"
+    echo -e "${bold}${cyan}║${reset} ${green}User:${reset}       ${bold}${username}@${hostname}${reset}"
+    echo -e "${bold}${cyan}║${reset} ${green}Shell:${reset}      ZSH ${shell_version}"
+    echo -e "${bold}${cyan}║${reset} ${green}System:${reset}     ${os_type} ${kernel}"
+    echo -e "${bold}${cyan}║${reset} ${green}Date:${reset}       ${current_date}"
+    echo -e "${bold}${cyan}║${reset} ${green}Time:${reset}       ${current_time}"
+    
+    if [[ -n "$uptime_info" ]]; then
+      echo -e "${bold}${cyan}║${reset} ${green}Uptime:${reset}     ${uptime_info}"
+    fi
+    
+    if [[ -n "$load_avg" ]]; then
+      echo -e "${bold}${cyan}║${reset} ${green}Load Avg:${reset}   ${load_avg}"
+    fi
+    
+    echo -e "${bold}${cyan}╚════════════════════════════════════════════════════════════╝${reset}"
+  elif [[ "$mode" == "minimal" ]]; then
+    echo -e "${bold}${cyan}Welcome ${magenta}${username}${cyan}!${reset} Shell: ZSH ${shell_version} | ${current_time}"
+  fi
+}
