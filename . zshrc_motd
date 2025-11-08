@@ -1,0 +1,326 @@
+# === MOTD / Welcome Banner (Apple Silicon focused, Linux-aware) ===
+
+# Spinner (no ms math; capped ~1.2s; hides cursor if available)
+__motd_spinner() {
+  local pid="$1" msg="${2:-booting...}"
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local i=0 n=0 max=15
+  command -v tput >/dev/null 2>&1 && tput civis
+  while kill -0 "$pid" 2>/dev/null && (( n < max )); do
+    printf "\r%s  %s" "${frames[$i]}" "$msg"
+    i=$(( (i+1) % ${#frames[@]} ))
+    n=$(( n+1 ))
+    sleep 0.08
+  done
+  printf "\r%*s\r" 50 ""
+  command -v tput >/dev/null 2>&1 && tput cnorm
+}
+
+# Gather metrics in a subshell; write shell-escaped key=value lines
+__motd_gather() {
+  (
+    local OS now host kernel
+    OS=$(uname -s)
+    now=$(date "+%A %b %d, %Y — %I:%M %p")
+    host=$(hostname)
+    kernel=$(uname -r)
+
+    # defaults
+    local cpu_busy="N/A" cpu_top="N/A" mem_pct="N/A" swap_str="N/A"
+    local docker_cont="N/A" ssid="N/A" ip="N/A" wan="N/A" dns_summary="N/A"
+    local vpn="No" vpn_note="" uptime_short="N/A" load1="N/A"
+    local updates_hint
+
+    if [[ "$OS" == "Darwin" ]]; then
+      # Uptime / load
+      uptime_short=$(uptime | sed -E 's/.*up ([^,]+),.*/\1/')
+      load1=$(uptime | awk -F'load averages?: ' '{print $2}' | awk '{print $1}')
+
+      # CPU busy = 100 - idle% parsed from top
+      cpu_busy=$(top -l 1 -n 0 2>/dev/null \
+        | awk -F', ' '/CPU usage/ {
+            idle=0;
+            for(i=1;i<=NF;i++) if ($i ~ /idle/) {
+              gsub(/[^0-9.]/,"",$i); idle=$i
+            }
+          }
+          END { if (idle!="") printf("%d", 100-idle); }')
+      [[ -z "$cpu_busy" ]] && cpu_busy="N/A"
+
+      # Top CPU process
+      local top_line
+      top_line=$(ps -axo pid,pcpu,comm | sort -k2 -nr | sed -n '1p')
+      [[ -n "$top_line" ]] && cpu_top=$(echo "$top_line" | awk '{print $3 " (" $2 "%)"}' | sed 's#.*/##')
+
+      # Memory pressure -> used %
+      if command -v memory_pressure >/dev/null 2>&1; then
+        local free_pct
+        free_pct=$(memory_pressure -Q 2>/dev/null | awk -F': ' '/free percentage/ {print int($2)}')
+        [[ -n "$free_pct" ]] && mem_pct=$((100 - free_pct))
+      fi
+
+      # Swap
+      if command -v sysctl >/dev/null 2>&1; then
+        swap_str=$(sysctl vm.swapusage 2>/dev/null | sed 's/^vm.swapusage: //')
+      fi
+
+      # Docker containers running
+      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        docker_cont=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+      fi
+
+      # SSID
+      if command -v networksetup >/dev/null 2>&1; then
+        ssid=$(networksetup -getairportnetwork en0 2>/dev/null | sed 's/Current Wi-Fi Network: //')
+        [[ -z "$ssid" ]] && ssid=$(networksetup -getairportnetwork en1 2>/dev/null | sed 's/Current Wi-Fi Network: //')
+        [[ -z "$ssid" ]] && ssid="N/A"
+      fi
+
+      # LAN IP (Darwin returns IPv4 here)
+      ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "N/A")
+
+      # WAN IP (DNS fast; curl fallback 1s)
+      if command -v dig >/dev/null 2>&1; then
+        wan=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null)
+      fi
+      if [[ -z "$wan" || "$wan" == "N/A" ]] && command -v curl >/dev/null 2>&1; then
+        wan=$(curl -s --max-time 1 https://ifconfig.me 2>/dev/null)
+      fi
+      [[ -z "$wan" ]] && wan="N/A"
+
+      # DNS resolvers
+      if [[ -r /etc/resolv.conf ]]; then
+        local ns ns_disp=""
+        while read -r ns; do
+          ns=${ns##nameserver }; ns=${ns%% *}; [[ -z "$ns" ]] && continue
+          local cls="public"
+          case "$ns" in
+            10.*|192.168.*|172.16.*|172.17.*|172.18.*|172.19.*|172.2[0-9].*|172.30.*|172.31.*) cls="private" ;;
+            1.1.1.1|1.0.0.1) cls="Cloudflare" ;;
+            8.8.8.8|8.8.4.4) cls="Google" ;;
+          esac
+          ns_disp+="$ns($cls) "
+        done < <(awk '/^nameserver/ {print}' /etc/resolv.conf 2>/dev/null)
+        [[ -n "$ns_disp" ]] && dns_summary="${ns_disp%% }"
+      fi
+
+      # VPN hints
+      if ifconfig 2>/dev/null | grep -q '^utun'; then vpn="Likely"; vpn_note+="utun "; fi
+      if command -v scutil >/dev/null 2>&1 && scutil --nc list 2>/dev/null | grep -q "Connected"; then vpn="Yes"; vpn_note+="scutil "; fi
+      if pgrep -x tailscaled >/dev/null 2>&1; then vpn="Yes"; vpn_note+="tailscale "; fi
+      vpn_note=${vpn_note%% }
+
+      updates_hint="manual: 'softwareupdate -l'"
+
+    else
+      # Linux quick path
+      uptime_short=$(uptime -p 2>/dev/null | sed 's/^up //')
+      [[ -z "$uptime_short" ]] && uptime_short=$(uptime | sed -E 's/.*up ([^,]+),.*/\1/')
+      if [[ -r /proc/loadavg ]]; then
+        load1=$(awk '{print $1}' /proc/loadavg)
+      else
+        load1=$(uptime | awk -F'load average: ' '{print $2}' | awk '{print $1}')
+      fi
+      # CPU busy from top (GNU)
+      if command -v top >/dev/null 2>&1; then
+        local idle
+        idle=$(top -b -n1 2>/dev/null | awk -F',' '/Cpu\(s\)/ {for(i=1;i<=NF;i++) if ($i ~ /id/) {gsub(/[^0-9.]/,"",$i); print $i}}' | head -n1)
+        [[ -n "$idle" ]] && cpu_busy=$(( 100 - ${idle%.*} ))
+      fi
+      # memory
+      if command -v free >/dev/null 2>&1; then
+        mem_pct=$(free | awk '/Mem:/ {printf("%d", ($3/$2)*100)}')
+      fi
+      # swap
+      if command -v swapon >/dev/null 2>&1; then
+        swap_str=$(swapon --show 2>/dev/null | tail -n +2 | awk '{s+=$3} END{printf("%d MB", s/1024)}')
+        [[ -z "$swap_str" ]] && swap_str="N/A"
+      fi
+      # docker
+      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        docker_cont=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+      fi
+      # IP (force IPv4)
+      ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)
+      if [[ -z "$ip" ]]; then
+        ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+      fi
+      if [[ -z "$ip" ]]; then
+        ip=$(ip a 2>/dev/null | awk '/inet /{print $2}' | sed 's#/.*##' | grep -v '^127\.' | head -n1)
+      fi
+      [[ -z "$ip" ]] && ip="N/A"
+
+      # WAN
+      if command -v dig >/dev/null 2>&1; then
+        wan=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null)
+      fi
+      if [[ -z "$wan" || "$wan" == "N/A" ]] && command -v curl >/dev/null 2>&1; then
+        wan=$(curl -s --max-time 1 https://ifconfig.me 2>/dev/null)
+      fi
+      [[ -z "$wan" ]] && wan="N/A"
+      # DNS
+      if [[ -r /etc/resolv.conf ]]; then
+        local ns ns_disp=""
+        while read -r ns; do
+          ns=${ns##nameserver }; ns=${ns%% *}; [[ -z "$ns" ]] && continue
+          local cls="public"
+          case "$ns" in
+            10.*|192.168.*|172.16.*|172.17.*|172.18.*|172.19.*|172.2[0-9].*|172.30.*|172.31.*) cls="private" ;;
+            1.1.1.1|1.0.0.1) cls="Cloudflare" ;;
+            8.8.8.8|8.8.4.4) cls="Google" ;;
+          esac
+          ns_disp+="$ns($cls) "
+        done < <(awk '/^nameserver/ {print}' /etc/resolv.conf 2>/dev/null)
+        [[ -n "$ns_disp" ]] && dns_summary="${ns_disp%% }"
+      fi
+      # VPN hints
+      if ip link 2>/dev/null | grep -Eq 'tun0|wg0'; then vpn="Likely"; vpn_note+="tun/wg "; fi
+      if systemctl is-active openvpn >/dev/null 2>&1; then vpn="Yes"; vpn_note+="openvpn "; fi
+      if pgrep -x tailscaled >/dev/null 2>&1; then vpn="Yes"; vpn_note+="tailscale "; fi
+      vpn_note=${vpn_note%% }
+      updates_hint="manual: 'sudo apt update && apt list --upgradable'"
+    fi
+
+    # Persist WAN for change-detect
+    local cache_dir="$HOME/.cache"; mkdir -p "$cache_dir" 2>/dev/null
+    local prev_wan=""
+    [[ -f "$cache_dir/motd_prev_wan" ]] && prev_wan=$(cat "$cache_dir/motd_prev_wan" 2>/dev/null || true)
+    [[ "$wan" != "N/A" ]] && echo "$wan" > "$cache_dir/motd_prev_wan" 2>/dev/null || true
+
+    # Persist LAN (new)
+    local prev_lan=""
+    [[ -f "$cache_dir/motd_prev_lan" ]] && prev_lan=$(cat "$cache_dir/motd_prev_lan" 2>/dev/null || true)
+    [[ "$ip" != "N/A" ]] && echo "$ip" > "$cache_dir/motd_prev_lan" 2>/dev/null || true
+
+    # Emit results with shell-escaped values
+    emit() { printf '%s=%q\n' "$1" "$2"; }
+    emit OS "$OS"
+    emit NOW "$now"
+    emit HOST "$host"
+    emit KERNEL "$kernel"
+    emit UPTIME "$uptime_short"
+    emit LOAD1 "$load1"
+    emit CPU_BUSY "$cpu_busy"
+    emit CPU_TOP "$cpu_top"
+    emit MEM_PCT "$mem_pct"
+    emit SWAP "$swap_str"
+    emit DOCKER_CONT "$docker_cont"
+    emit SSID "$ssid"
+    emit LAN_IP "$ip"
+    emit WAN_IP "$wan"
+    emit PREV_WAN "$prev_wan"
+    emit PREV_LAN "$prev_lan"
+    emit DNS "$dns_summary"
+    emit VPN "$vpn"
+    emit VPN_NOTE "$vpn_note"
+    emit UPDATES "$updates_hint"
+  ) > "$1"
+}
+
+_print_welcome_banner() {
+  local MODE="${1:-light}"
+
+  # Colors
+  local CYAN="\033[38;5;87m"; local BLUE="\033[38;5;45m"; local MAGENTA="\033[38;5;213m"
+  local YELLOW="\033[38;5;227m"; local RED="\033[38;5;196m"; local GREEN="\033[38;5;82m"
+  local BOLD="\033[1m"; local RESET="\033[0m"
+
+  # Temp results file
+  local tmpf; tmpf="$(mktemp -t motd.XXXXXX)"
+
+  # Run gather in background and disown to avoid [n] job messages
+  __motd_gather "$tmpf" &!
+  local gp=$!
+
+  # Spinner
+  __motd_spinner "$gp" "warming up the cockpit"
+  wait "$gp" 2>/dev/null
+
+  # Load results (safe: values are shell-escaped)
+  local OS NOW HOST KERNEL UPTIME LOAD1 CPU_BUSY CPU_TOP MEM_PCT SWAP DOCKER_CONT SSID LAN_IP WAN_IP PREV_WAN PREV_LAN DNS VPN VPN_NOTE UPDATES
+  source "$tmpf" 2>/dev/null || true
+  rm -f "$tmpf" 2>/dev/null || true
+
+  # Warnings
+  local WARN=""
+  if [[ "$CPU_BUSY" != "N/A" ]]; then
+    local cb=${CPU_BUSY%.*}; (( cb > 85 )) && WARN+="⚠️  High CPU (${CPU_BUSY}%) "
+  fi
+  if [[ "$MEM_PCT" != "N/A" ]]; then
+    local mp=${MEM_PCT%.*}; (( mp > 85 )) && WARN+="⚠️  Memory high (${MEM_PCT}%) "
+  fi
+  if [[ -n "$PREV_WAN" && "$WAN_IP" != "N/A" && "$WAN_IP" != "$PREV_WAN" ]]; then
+    WARN+="⚠️  WAN changed (${PREV_WAN} → ${WAN_IP}) "
+  fi
+  if [[ -n "$PREV_LAN" && "$LAN_IP" != "N/A" && "$LAN_IP" != "$PREV_LAN" ]]; then
+    WARN+="⚠️  LAN changed (${PREV_LAN} → ${LAN_IP}) "
+  fi
+
+  # Quote
+  local quotes=(
+    "Small steps compound — ship something tiny today."
+    "You're sharper than you feel — self-trust compounds."
+    "Flow happens after the first uncomfortable push."
+    "The code gets better because you show up — not luck."
+    "Confidence builds from solving today's problem."
+    "When energy dips, discipline carries you."
+    "Your future-self will thank you for this session."
+    "Tiny progress prevents giant regret."
+    "Lead with clarity. Ship with intention."
+    "Real engineering = curiosity + patience + caffeine."
+    "A bug is a puzzle. You're a solver. Game on."
+    "If you can think, you can build. And you're thinking."
+    "One clean commit > ten messy attempts."
+  )
+  local msg=${quotes[$((RANDOM % ${#quotes[@]}))]}
+
+  # Output
+  printf "%b\n" "${MAGENTA}✨ Welcome back, Conner.${RESET}"
+  printf "%b\n\n" "${CYAN}${msg}${RESET}"
+
+  printf "%b\n" "${YELLOW}${BOLD}System Snapshot${RESET}"
+  printf " 🕒  %s\n" "${NOW:-N/A}"
+  printf " 💻  %s (%s %s)\n" "${HOST:-N/A}" "${OS:-N/A}" "${KERNEL:-N/A}"
+  printf " 🚀  Uptime: %s\n" "${UPTIME:-N/A}"
+
+  printf " 🧠  CPU: %s%%" "${CPU_BUSY:-N/A}"
+  [[ -n "${CPU_TOP:-}" && "${CPU_TOP}" != "N/A" ]] && printf "   📦 Top: %s" "${CPU_TOP}"
+  printf "\n"
+  printf " 💾  RAM: %s%%   🧊 Swap: %s\n" "${MEM_PCT:-N/A}" "${SWAP:-N/A}"
+  printf " 🐳  Docker containers: %s\n" "${DOCKER_CONT:-N/A}"
+
+  printf " 📶  SSID: %s\n" "${SSID:-N/A}"
+  printf " 🔐  VPN: %s%s\n" "${VPN:-No}" "${VPN_NOTE:+  (${VPN_NOTE})}"
+
+  # LAN with previous
+  if [[ -n "$PREV_LAN" && "$LAN_IP" != "N/A" && "$LAN_IP" != "$PREV_LAN" ]]; then
+    printf " 🌐  LAN: %s (prev %s)\n" "${LAN_IP:-N/A}" "${PREV_LAN:-N/A}"
+  else
+    printf " 🌐  LAN: %s\n" "${LAN_IP:-N/A}"
+  fi
+
+  printf " 🌎  WAN: %s\n" "${WAN_IP:-N/A}"
+  printf " 🧭  DNS: %s\n" "${DNS:-N/A}"
+  printf " 📦  Updates: %s\n" "${UPDATES:-N/A}"
+  [[ -n "$WARN" ]] && printf " %b%s%b\n" "$RED" "$WARN" "$RESET"
+
+  if [[ "$MODE" == "full" ]]; then
+    printf "\n%b\n" "${BLUE}Deep checks...${RESET}"
+    if [[ "${OS}" == "Darwin" ]]; then
+      log show --style syslog --predicate 'eventMessage CONTAINS "Failed to authenticate user"' --last 1m 2>/dev/null | tail -n 3
+    else
+      sudo tail -n 20 /var/log/auth.log 2>/dev/null | egrep -i "failed|refused|invalid|accepted" | tail -n 5
+    fi
+  fi
+
+  printf "\n%b\n\n" "${MAGENTA}Let's ship greatness. 🧠⚡${RESET}"
+}
+
+# Convenience: run deep mode on demand
+motd() {
+  if [[ "$1" == "--full" ]]; then
+    _print_welcome_banner full
+  else
+    _print_welcome_banner light
+  fi
+}
